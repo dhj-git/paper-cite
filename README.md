@@ -108,3 +108,6 @@ deactivate
 - 在底部选择 BibTeX、GB/T 7714、APA、IEEE 或 RIS 格式。
 - 使用“复制预览”复制引用，或使用“导出文件”下载结果。
 - 也可以拖入 PDF 文件，应用会尝试提取 DOI 或标题后自动检索。
+
+## 运行示例
+![alt text](image.png)
