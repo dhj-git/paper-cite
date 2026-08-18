@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
@@ -22,6 +23,9 @@ USER_AGENT = "paper-cite/0.1 (local academic citation tool; mailto:paper-cite@ex
 SEMANTIC_SCHOLAR_API_URL = "https://api.semanticscholar.org/graph/v1"
 SEMANTIC_SCHOLAR_FIELDS = "paperId,title,authors,year,venue,publicationVenue,publicationTypes,externalIds,url,openAccessPdf,journal"
 MAX_PDF_SIZE = 15 * 1024 * 1024
+MAX_BATCH_FILES = 50
+MAX_BATCH_SIZE = 250 * 1024 * 1024
+BATCH_CONCURRENCY = 3
 DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
 ARXIV_RE = re.compile(r"(?:arxiv:\s*)?(\d{4}\.\d{4,5}(?:v\d+)?|[a-z-]+/\d{7})(?:\.pdf)?", re.I)
 PMID_RE = re.compile(r"(?:pmid:\s*)?(\d{6,9})$", re.I)
@@ -55,6 +59,29 @@ class SearchResponse(BaseModel):
 class FormatRequest(BaseModel):
     items: list[Paper]
     format: str
+
+
+class BatchItem(BaseModel):
+    filename: str
+    status: str = "pending"
+    query: str = ""
+    results: list[Paper] = Field(default_factory=list)
+    source_status: dict[str, str] = Field(default_factory=dict)
+    extracted: dict[str, Any] | None = None
+    error: str = ""
+
+
+class BatchStatus(BaseModel):
+    batch_id: str
+    status: str = "pending"
+    total: int
+    completed: int = 0
+    failed: int = 0
+    items: list[BatchItem]
+
+
+BATCHES: dict[str, BatchStatus] = {}
+RUNNING_BATCHES: set[asyncio.Task[None]] = set()
 
 
 app = FastAPI(title="Paper Cite", version="0.1.0")
@@ -292,11 +319,7 @@ async def search(q: str = Query(min_length=2, max_length=500)) -> SearchResponse
     return SearchResponse(query=q, results=results, source_status=status)
 
 
-@app.post("/api/pdf", response_model=SearchResponse)
-async def parse_pdf(file: UploadFile = File(...)) -> SearchResponse:
-    data = await file.read(MAX_PDF_SIZE + 1)
-    if len(data) > MAX_PDF_SIZE:
-        raise HTTPException(413, "PDF 不能超过 15 MB")
+def extract_pdf_data(data: bytes, filename: str | None) -> dict[str, Any]:
     if not data.startswith(b"%PDF-"):
         raise HTTPException(400, "文件不是有效的 PDF")
     try:
@@ -309,6 +332,7 @@ async def parse_pdf(file: UploadFile = File(...)) -> SearchResponse:
         raise
     except Exception as exc:
         raise HTTPException(400, "无法解析 PDF") from exc
+
     doi = clean_doi(first_page) or clean_doi(str(metadata.get("subject", "")))
     title = str(metadata.get("title") or "").strip()
     if not title or title.lower() in {"untitled", "microsoft word"}:
@@ -317,9 +341,89 @@ async def parse_pdf(file: UploadFile = File(...)) -> SearchResponse:
     query = doi or title
     if not query:
         raise HTTPException(422, "未能从 PDF 提取 DOI 或标题")
-    results, status = await perform_search(query)
-    extracted = {"filename": file.filename, "title": title, "doi": doi, "metadata": {key: metadata.get(key, "") for key in ("author", "subject", "keywords")}}
-    return SearchResponse(query=query, results=results, source_status=status, extracted=extracted)
+    return {
+        "query": query,
+        "filename": filename,
+        "title": title,
+        "doi": doi,
+        "metadata": {key: metadata.get(key, "") for key in ("author", "subject", "keywords")},
+    }
+
+
+@app.post("/api/pdf", response_model=SearchResponse)
+async def parse_pdf(file: UploadFile = File(...)) -> SearchResponse:
+    data = await file.read(MAX_PDF_SIZE + 1)
+    if len(data) > MAX_PDF_SIZE:
+        raise HTTPException(413, "PDF 不能超过 15 MB")
+    extracted = await asyncio.to_thread(extract_pdf_data, data, file.filename)
+    results, status = await perform_search(extracted["query"])
+    return SearchResponse(query=extracted["query"], results=results, source_status=status, extracted={key: value for key, value in extracted.items() if key != "query"})
+
+
+async def process_pdf_batch(batch_id: str, uploads: list[tuple[str, bytes]]) -> None:
+    batch = BATCHES[batch_id]
+    batch.status = "processing"
+    semaphore = asyncio.Semaphore(BATCH_CONCURRENCY)
+    searches: dict[str, asyncio.Task[tuple[list[Paper], dict[str, str]]]] = {}
+
+    async def process_item(index: int, filename: str, data: bytes) -> None:
+        item = batch.items[index]
+        async with semaphore:
+            item.status = "processing"
+            try:
+                extracted = await asyncio.to_thread(extract_pdf_data, data, filename)
+                item.extracted = {key: value for key, value in extracted.items() if key != "query"}
+                item.query = extracted["query"]
+                cache_key = clean_doi(item.query) or normalize_title(item.query)
+                if cache_key not in searches:
+                    searches[cache_key] = asyncio.create_task(perform_search(item.query))
+                item.results, item.source_status = await searches[cache_key]
+                item.status = "completed"
+                batch.completed += 1
+            except HTTPException as exc:
+                item.status = "failed"
+                item.error = str(exc.detail)
+                batch.failed += 1
+            except Exception:
+                item.status = "failed"
+                item.error = "处理 PDF 时发生内部错误"
+                batch.failed += 1
+
+    await asyncio.gather(*(process_item(index, filename, data) for index, (filename, data) in enumerate(uploads)))
+    batch.status = "completed"
+
+
+@app.post("/api/pdf-batches", response_model=BatchStatus, status_code=202)
+async def create_pdf_batch(files: list[UploadFile] = File(...)) -> BatchStatus:
+    if not 1 <= len(files) <= MAX_BATCH_FILES:
+        raise HTTPException(400, f"每批必须上传 1 到 {MAX_BATCH_FILES} 个 PDF")
+
+    uploads: list[tuple[str, bytes]] = []
+    total_size = 0
+    for file in files:
+        data = await file.read(MAX_PDF_SIZE + 1)
+        if len(data) > MAX_PDF_SIZE:
+            raise HTTPException(413, f"{file.filename or 'PDF'} 超过 15 MB")
+        total_size += len(data)
+        if total_size > MAX_BATCH_SIZE:
+            raise HTTPException(413, "整批 PDF 不能超过 250 MB")
+        uploads.append((file.filename or "unnamed.pdf", data))
+
+    batch_id = uuid.uuid4().hex[:12]
+    batch = BatchStatus(batch_id=batch_id, total=len(uploads), items=[BatchItem(filename=filename) for filename, _ in uploads])
+    BATCHES[batch_id] = batch
+    task = asyncio.create_task(process_pdf_batch(batch_id, uploads))
+    RUNNING_BATCHES.add(task)
+    task.add_done_callback(RUNNING_BATCHES.discard)
+    return batch
+
+
+@app.get("/api/pdf-batches/{batch_id}", response_model=BatchStatus)
+async def get_pdf_batch(batch_id: str) -> BatchStatus:
+    batch = BATCHES.get(batch_id)
+    if batch is None:
+        raise HTTPException(404, "批量任务不存在")
+    return batch
 
 
 @app.post("/api/format")

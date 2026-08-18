@@ -45,6 +45,10 @@
 | `source_status` | object | 各数据源的执行状态 |
 | `extracted` | object/null | 仅 PDF 接口返回提取结果 |
 
+### BatchStatus
+
+批量任务包含 `batch_id`、`status`、`total`、`completed`、`failed` 和 `items`。每个文件项包含 `filename`、`status`、`query`、`results`、`source_status`、`extracted` 和 `error`。
+
 ## 健康检查
 
 `GET /api/health`
@@ -137,6 +141,44 @@ curl -X POST http://127.0.0.1:8000/api/pdf \
   }
 }
 ```
+
+## 批量上传 PDF
+
+### 创建任务
+
+`POST /api/pdf-batches`
+
+- 重复使用表单字段 `files` 上传 1～50 个 PDF
+- 单文件不超过 15 MB，整批不超过 250 MB
+- 返回 `202 Accepted`，文件在后台继续处理
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/pdf-batches \
+  -F "files=@./paper-1.pdf" \
+  -F "files=@./paper-2.pdf"
+```
+
+响应示例：
+
+```json
+{
+  "batch_id": "b4d87fae1234",
+  "status": "processing",
+  "total": 2,
+  "completed": 1,
+  "failed": 0,
+  "items": [
+    {"filename": "paper-1.pdf", "status": "completed", "query": "10.1234/example", "results": []},
+    {"filename": "paper-2.pdf", "status": "processing", "query": "", "results": []}
+  ]
+}
+```
+
+### 查询任务
+
+`GET /api/pdf-batches/{batch_id}`
+
+客户端可以每秒轮询一次，直到顶层 `status` 变为 `completed`。每个文件独立成功或失败；服务端最多同时处理 3 个文件，并对同批次的重复 DOI 或标题复用检索结果。
 
 ## 格式化引用
 
