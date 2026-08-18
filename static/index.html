@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paper Cite | 论文引用整理</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar"><div><strong>Paper Cite</strong><span>论文引用整理工具</span></div><a href="/api/health" target="_blank" rel="noreferrer">服务状态</a></header>
+  <main class="workspace">
+    <section class="panel search-panel" aria-labelledby="search-heading">
+      <div class="panel-head"><div><h1 id="search-heading">检索论文</h1><p>输入 DOI、标题、arXiv ID、PubMed ID 或论文链接</p></div></div>
+      <form id="search-form" class="search-form"><label for="query">检索内容</label><div class="search-row"><input id="query" name="query" autocomplete="off" placeholder="例如：10.1038/s41586-020-2649-2" required><button type="submit">检索</button></div></form>
+      <div id="drop-zone" class="drop-zone" tabindex="0"><input id="pdf-input" type="file" accept="application/pdf" hidden><span class="upload-icon" aria-hidden="true">↑</span><strong>拖入 PDF，或 <button type="button" id="browse">选择文件</button></strong><small>最大 15 MB，仅支持 PDF</small></div>
+      <div id="message" class="message" role="status" aria-live="polite"></div>
+      <div class="source-status" id="source-status"></div>
+      <div id="results" class="results" aria-live="polite"><div class="empty">输入检索内容后，候选论文会显示在这里。</div></div>
+    </section>
+    <section class="panel library-panel" aria-labelledby="library-heading">
+      <div class="panel-head library-head"><div><h2 id="library-heading">我的文献库 <span id="count">0</span></h2><p>拖拽排序，字段改动会立即保存于当前页面</p></div><button id="clear-library" class="secondary" type="button">清空</button></div>
+      <div id="library" class="library"><div class="empty">文献库为空。将左侧候选加入后即可编辑和格式化。</div></div>
+      <div class="format-bar"><label for="format">引用格式</label><select id="format"><option value="bibtex">BibTeX</option><option value="gbt7714">GB/T 7714-2015</option><option value="apa">APA</option><option value="ieee">IEEE</option><option value="ris">RIS</option></select><button id="copy" class="secondary" type="button">复制预览</button><button id="export" type="button">导出文件</button></div>
+      <pre id="preview" class="preview" aria-label="引用预览">添加文献后显示引用格式。</pre>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
